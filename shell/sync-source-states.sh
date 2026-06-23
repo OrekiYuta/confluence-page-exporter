@@ -2,12 +2,16 @@
 # Sync Confluence spaces and page trees into source-states/ as YAML files
 #
 # Usage:
-#   ./shell/sync-source-states.sh                  # full sync (all spaces + page trees)
+#   ./shell/sync-source-states.sh                  # full sync (all spaces + page trees, 3 concurrent)
 #   ./shell/sync-source-states.sh --no-personal    # skip personal spaces
 #   ./shell/sync-source-states.sh --spaces-only    # only generate spaces.yaml (no page trees)
-#   ./shell/sync-source-states.sh --space 0003     # sync single space (updates spaces.yaml + generates pages/0003.yaml)
+#   ./shell/sync-source-states.sh --pages-only     # only generate pages/*.yaml (read from existing spaces.yaml)
+#   ./shell/sync-source-states.sh --space 0003     # sync single space
+#   ./shell/sync-source-states.sh --concurrency 5  # set number of parallel workers (default: 3)
+#
+# Resume: already generated pages/*.yaml files are skipped automatically.
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -16,18 +20,23 @@ PAGES_DIR="${OUTPUT_DIR}/pages"
 
 SKIP_PERSONAL=false
 SPACES_ONLY=false
+PAGES_ONLY=false
 SINGLE_SPACE=""
+CONCURRENCY=3
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-personal) SKIP_PERSONAL=true; shift ;;
         --spaces-only) SPACES_ONLY=true; shift ;;
+        --pages-only) PAGES_ONLY=true; shift ;;
         --space) SINGLE_SPACE="$2"; shift 2 ;;
+        --concurrency) CONCURRENCY="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
-mkdir -p "$PAGES_DIR"
+LOG_DIR="${OUTPUT_DIR}/logs"
+mkdir -p "$PAGES_DIR" "$LOG_DIR"
 
 # Get Confluence domain from config
 CONFLUENCE_DOMAIN=$(jq -r '.profiles[.activeProfile].domain' ~/.confluence-cli/config.json 2>/dev/null)
@@ -185,34 +194,45 @@ EOF
     }'
 }
 
-# --- Sync a single space's page tree ---
+# --- Sync a single space's page tree (called by worker) ---
 sync_space_pages() {
     local key="$1"
     local name="$2"
     local output_file="${PAGES_DIR}/${key}.yaml"
 
+    # Skip if already generated
+    if [ -f "$output_file" ]; then
+        echo "  [skip] ${key} (already exists)"
+        return 0
+    fi
+
     local homepage_id
     homepage_id=$(confluence api "space/${key}?expand=homepage" --jq ".homepage.id" 2>/dev/null | tr -d '"')
 
     if [ -z "$homepage_id" ] || [ "$homepage_id" = "null" ]; then
-        echo "    [!] No homepage found, skipping page tree"
-        return
+        echo "  [!] ${key} - No homepage found, skipping"
+        return 1
     fi
 
     local tree_output
     tree_output=$(NO_COLOR=1 confluence children "$homepage_id" --recursive --format tree --show-id --show-url 2>&1)
 
     if echo "$tree_output" | grep -q "Error\|error"; then
-        echo "    [!] Failed to fetch page tree"
-        return
+        echo "  [!] ${key} - Failed to fetch page tree"
+        return 1
     fi
 
     local parsed
     parsed=$(parse_tree_to_yaml "$tree_output")
 
     generate_pages_yaml "$key" "$name" "$parsed" > "$output_file"
-    echo "    -> pages/${key}.yaml"
+    echo "  [ok] ${key} -> pages/${key}.yaml"
+    return 0
 }
+
+# Export functions for xargs subshells
+export -f sync_space_pages parse_tree_to_yaml generate_pages_yaml
+export PAGES_DIR TIMESTAMP
 
 # --- Update or insert a space entry in spaces.yaml ---
 upsert_space_in_yaml() {
@@ -237,7 +257,6 @@ EOF
 )
 
     if [ ! -f "$spaces_file" ]; then
-        # Create new spaces.yaml
         cat > "$spaces_file" <<EOF
 generated_at: "${TIMESTAMP}"
 total: 1
@@ -247,9 +266,7 @@ EOF
         return
     fi
 
-    # Check if space already exists in the file
     if grep -q "key: \"${key}\"" "$spaces_file"; then
-        # Remove existing entry block: "  - key: ..." line and all following indented lines (4 spaces+)
         local tmp_file="${spaces_file}.tmp"
         awk -v key="\"${key}\"" '
         BEGIN { skip = 0 }
@@ -268,15 +285,11 @@ EOF
         mv "$tmp_file" "$spaces_file"
     fi
 
-    # Append entry
     echo "$entry" >> "$spaces_file"
 
-    # Update total count
     local count
     count=$(grep -c "^  - key:" "$spaces_file" || echo "0")
     sed -i '' "s/^total: .*/total: ${count}/" "$spaces_file"
-
-    # Update timestamp
     sed -i '' "s/^generated_at: .*/generated_at: \"${TIMESTAMP}\"/" "$spaces_file"
 }
 
@@ -288,14 +301,12 @@ EOF
 if [ -n "$SINGLE_SPACE" ]; then
     echo "Syncing space [${SINGLE_SPACE}]..."
 
-    # Fetch space info
     space_name=$(confluence api "space/${SINGLE_SPACE}" --jq ".name" 2>/dev/null | tr -d '"')
     if [ -z "$space_name" ] || [ "$space_name" = "null" ]; then
         echo "Error: Space '${SINGLE_SPACE}' not found"
         exit 1
     fi
 
-    # Get metadata
     category=$(get_category "$SINGLE_SPACE")
     pages=$(get_page_count "$SINGLE_SPACE")
     url="${BASE_URL}/${SINGLE_SPACE}"
@@ -304,18 +315,77 @@ if [ -n "$SINGLE_SPACE" ]; then
     echo "  Category: ${category:-"-"}"
     echo "  Pages: ${pages}"
 
-    # Update spaces.yaml
     upsert_space_in_yaml "$SINGLE_SPACE" "$space_name" "$category" "$pages" "$url"
     echo "  -> spaces.yaml (updated)"
 
-    # Sync page tree
     if [ "$pages" -gt 0 ] 2>/dev/null; then
+        # Force regenerate for single space (remove skip check)
+        rm -f "${PAGES_DIR}/${SINGLE_SPACE}.yaml"
         sync_space_pages "$SINGLE_SPACE" "$space_name"
     else
-        echo "    [!] No pages, skipping page tree"
+        echo "  [!] No pages, skipping page tree"
     fi
 
     echo "Done."
+    exit 0
+fi
+
+# --- Mode: pages only (read from existing spaces.yaml, parallel) ---
+if [ "$PAGES_ONLY" = "true" ]; then
+    SPACES_FILE="${OUTPUT_DIR}/spaces.yaml"
+    if [ ! -f "$SPACES_FILE" ]; then
+        echo "Error: spaces.yaml not found. Run --spaces-only first."
+        exit 1
+    fi
+
+    echo "Reading spaces from existing spaces.yaml..."
+    total=$(grep "^total:" "$SPACES_FILE" | sed 's/total: //')
+
+    # Build work list: spaces with pages > 0 that don't already have a YAML file
+    WORK_LIST=$(grep -A4 "^  - key:" "$SPACES_FILE" | awk '
+    /^  - key:/ { key=$NF; gsub(/"/, "", key) }
+    /    name:/ { sub(/^    name: /, ""); gsub(/"/, ""); name=$0 }
+    /    pages:/ { pages=$NF }
+    /    url:/ {
+        if (pages > 0) {
+            print key "\t" name
+        }
+    }
+    ')
+
+    total_work=$(echo "$WORK_LIST" | wc -l | tr -d ' ')
+    already_done=$(ls "$PAGES_DIR"/*.yaml 2>/dev/null | wc -l | tr -d ' ')
+    remaining=$((total_work - already_done))
+
+    echo "Total spaces with pages: $total_work"
+    echo "Already generated: $already_done"
+    echo "Remaining: $remaining"
+    echo "Concurrency: $CONCURRENCY"
+    echo ""
+
+    if [ "$remaining" -le 0 ]; then
+        echo "All page trees already generated. Nothing to do."
+        exit 0
+    fi
+
+    # Write pending work to temp files
+    WORK_FILE=$(mktemp)
+    NAMES_FILE=$(mktemp)
+    echo "$WORK_LIST" | while IFS=$'\t' read -r key name; do
+        [ -f "${PAGES_DIR}/${key}.yaml" ] && continue
+        echo "$key" >> "$WORK_FILE"
+        printf '%s\t%s\n' "$key" "$name" >> "$NAMES_FILE"
+    done
+
+    # Run workers in parallel
+    WORKER="${SCRIPT_DIR}/_sync-page-worker.sh"
+    cat "$WORK_FILE" | xargs -P "$CONCURRENCY" -I '{}' "$WORKER" '{}' "$PAGES_DIR" "$TIMESTAMP" "$NAMES_FILE" "$LOG_DIR"
+    rm -f "$WORK_FILE" "$NAMES_FILE"
+
+    final_count=$(ls "$PAGES_DIR"/*.yaml 2>/dev/null | wc -l | tr -d ' ')
+    echo ""
+    echo "Done. Generated: $final_count page tree files in ${PAGES_DIR}/"
+    echo "Logs: ${LOG_DIR}/"
     exit 0
 fi
 
@@ -366,12 +436,34 @@ echo "$spaces_json" | jq -r '.spaces[] | "\(.key)\t\(.name)\t\(.type)"' | while 
 EOF
 
     echo "  [${i}] ${key} - ${pages} pages"
-
-    # Sync page tree (unless --spaces-only)
-    if [ "$SPACES_ONLY" = "false" ] && [ "$pages" -gt 0 ] 2>/dev/null; then
-        sync_space_pages "$key" "$name"
-    fi
 done
+
+# Sync page trees if not --spaces-only
+if [ "$SPACES_ONLY" = "false" ]; then
+    echo ""
+    echo "Generating page trees (concurrency: $CONCURRENCY)..."
+
+    WORK_FILE2=$(mktemp)
+    NAMES_FILE2=$(mktemp)
+    grep -A4 "^  - key:" "${OUTPUT_DIR}/spaces.yaml" | awk '
+    /^  - key:/ { key=$NF; gsub(/"/, "", key) }
+    /    name:/ { sub(/^    name: /, ""); gsub(/"/, ""); name=$0 }
+    /    pages:/ { pages=$NF }
+    /    url:/ {
+        if (pages > 0) {
+            print key "\t" name
+        }
+    }
+    ' | while IFS=$'\t' read -r key name; do
+        [ -f "${PAGES_DIR}/${key}.yaml" ] && continue
+        echo "$key" >> "$WORK_FILE2"
+        printf '%s\t%s\n' "$key" "$name" >> "$NAMES_FILE2"
+    done
+
+    WORKER="${SCRIPT_DIR}/_sync-page-worker.sh"
+    cat "$WORK_FILE2" | xargs -P "$CONCURRENCY" -I '{}' "$WORKER" '{}' "$PAGES_DIR" "$TIMESTAMP" "$NAMES_FILE2" "$LOG_DIR"
+    rm -f "$WORK_FILE2" "$NAMES_FILE2"
+fi
 
 echo ""
 echo "Done. Output: ${OUTPUT_DIR}/"
