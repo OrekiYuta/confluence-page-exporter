@@ -6,7 +6,7 @@ Usage:
     python3 scripts/sync_source_states.py                      # full sync
     python3 scripts/sync_source_states.py --spaces-only        # only spaces.yaml
     python3 scripts/sync_source_states.py --pages-only         # only pages/*.yaml
-    python3 scripts/sync_source_states.py --space 0003         # single space
+    python3 scripts/sync_source_states.py --space TNTEF         # single space
     python3 scripts/sync_source_states.py --no-personal        # skip personal spaces
     python3 scripts/sync_source_states.py --concurrency 5      # parallel workers (default: 3)
 
@@ -44,21 +44,24 @@ def get_confluence_domain():
         return "unknown.atlassian.net"
 
 
-def run_confluence(*args, env_override=None):
+def run_confluence(*args, env_override=None, timeout=300):
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
     if env_override:
         env.update(env_override)
-    result = subprocess.run(
-        ["confluence", *args],
-        capture_output=True, text=True, env=env
-    )
-    return result.stdout.strip()
+    try:
+        result = subprocess.run(
+            ["confluence", *args],
+            capture_output=True, text=True, env=env, timeout=timeout
+        )
+        return result.stdout.strip(), result.returncode
+    except subprocess.TimeoutExpired:
+        return "", -1
 
 
 def run_confluence_api_json(endpoint):
-    raw = run_confluence("api", endpoint, "--jq", ".")
-    if not raw:
+    raw, rc = run_confluence("api", endpoint, "--jq", ".")
+    if not raw or rc != 0:
         return None
     try:
         return json.loads(raw)
@@ -67,8 +70,8 @@ def run_confluence_api_json(endpoint):
 
 
 def fetch_all_spaces(skip_personal=False):
-    raw = run_confluence("spaces", "--all", "--json")
-    if not raw:
+    raw, rc = run_confluence("spaces", "--all", "--json")
+    if not raw or rc != 0:
         return []
     try:
         data = json.loads(raw)
@@ -93,7 +96,7 @@ def fetch_space_category(key):
 
 
 def fetch_page_count(key):
-    output = run_confluence("search", "--cql", f'type=page AND space="{key}"', "--limit", "10000")
+    output, rc = run_confluence("search", "--cql", f'type=page AND space="{key}"', "--limit", "10000")
     if not output:
         return 0
     match = re.match(r"Found (\d+) result", output)
@@ -112,10 +115,14 @@ def fetch_homepage_id(key):
 
 
 def fetch_page_tree(homepage_id):
-    return run_confluence(
+    output, rc = run_confluence(
         "children", homepage_id,
-        "--recursive", "--format", "tree", "--show-id", "--show-url"
+        "--recursive", "--format", "tree", "--show-id", "--show-url",
+        timeout=600
     )
+    if rc != 0:
+        return None
+    return output
 
 
 def parse_page_tree(tree_output):
@@ -177,36 +184,34 @@ def parse_page_tree(tree_output):
     return pages
 
 
-def fetch_update_times(space_key):
+def fetch_update_times_by_ids(page_ids):
     times = {}
-    start = 0
-    limit = 100
-    while True:
-        raw = run_confluence(
+    if not page_ids:
+        return times
+
+    batch_size = 40
+    for i in range(0, len(page_ids), batch_size):
+        batch = page_ids[i:i + batch_size]
+        ids_str = ",".join(batch)
+        cql = f"id in ({ids_str})"
+        encoded_cql = cql.replace(" ", "+")
+        raw, rc = run_confluence(
             "api",
-            f"content/search?cql=type%3Dpage+AND+space%3D{space_key}&expand=version&limit={limit}&start={start}",
+            f"content/search?cql={encoded_cql}&expand=version&limit={batch_size}",
             "--jq", "."
         )
-        if not raw:
-            break
+        if not raw or rc != 0:
+            continue
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            break
+            continue
 
-        results = data.get("results", [])
-        if not results:
-            break
-
-        for r in results:
+        for r in data.get("results", []):
             pid = str(r.get("id", ""))
             when = r.get("version", {}).get("when", "")
             if pid:
                 times[pid] = when
-
-        if len(results) < limit:
-            break
-        start += limit
 
     return times
 
@@ -320,6 +325,7 @@ def sync_single_space(key, name, pages_dir, log_dir, total_remaining):
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+    print(f"    [{key}] Fetching homepage...", flush=True)
     homepage_id = fetch_homepage_id(key)
     if not homepage_id:
         with counter_lock:
@@ -329,18 +335,20 @@ def sync_single_space(key, name, pages_dir, log_dir, total_remaining):
         print(f"  [{n}/{total_remaining}] [!] {key} - No homepage found, skipping")
         return "skip"
 
+    print(f"    [{key}] Fetching page tree (this may take a while)...", flush=True)
     tree_output = fetch_page_tree(homepage_id)
-    if not tree_output or "error" in tree_output.lower()[:100]:
+    if not tree_output:
         with counter_lock:
             counter_value += 1
             n = counter_value
         logger.info(f"FAIL fetch_tree key={key} homepage={homepage_id}")
-        logger.info(tree_output[:500] if tree_output else "empty output")
         print(f"  [{n}/{total_remaining}] [!] {key} - Failed to fetch page tree")
         return "fail"
 
     flat_pages = parse_page_tree(tree_output)
-    update_times = fetch_update_times(key)
+    page_ids = [p["id"] for p in flat_pages if p["id"]]
+    print(f"    [{key}] Fetching update times ({len(page_ids)} pages)...", flush=True)
+    update_times = fetch_update_times_by_ids(page_ids)
     pages_tree = build_nested_tree(flat_pages, update_times)
 
     write_pages_yaml(key, name, pages_tree, output_file)
@@ -406,20 +414,24 @@ def main():
         key = args.space
         print(f"Syncing space [{key}]...")
 
+        print(f"  Fetching space info...", flush=True)
         data = run_confluence_api_json(f"space/{key}")
         if not data:
             print(f"Error: Space '{key}' not found")
             sys.exit(1)
 
         name = data.get("name", key)
-        category = fetch_space_category(key)
-        pages = fetch_page_count(key)
-        url = f"{base_url}/{key}"
-
         print(f"  Space: {name}")
+
+        print(f"  Fetching category...", flush=True)
+        category = fetch_space_category(key)
         print(f"  Category: {category or '-'}")
+
+        print(f"  Counting pages...", flush=True)
+        pages = fetch_page_count(key)
         print(f"  Pages: {pages}")
 
+        url = f"{base_url}/{key}"
         space_entry = {"key": key, "name": name, "category": category, "pages": pages, "url": url}
 
         spaces_file = OUTPUT_DIR / "spaces.yaml"
