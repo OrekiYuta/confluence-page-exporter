@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Confluence Page Explorer</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <button id="sidebar-toggle" class="icon-btn" title="Toggle sidebar" aria-label="Toggle sidebar">&#9776;</button>
+      <span class="app-title">Confluence Page Explorer</span>
+    </div>
+    <div class="topbar-center">
+      <div class="space-picker">
+        <input
+          type="text"
+          id="space-search"
+          class="space-search"
+          placeholder="Search space by key, name, or category&hellip;"
+          autocomplete="off"
+        />
+        <ul id="space-results" class="space-results" hidden></ul>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="space-badge" class="space-badge" hidden></span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <div id="sidebar-space-name" class="sidebar-space-name">No space selected</div>
+        <div id="sidebar-space-meta" class="sidebar-space-meta"></div>
+        <input
+          type="text"
+          id="tree-filter"
+          class="tree-filter"
+          placeholder="Filter pages in this space&hellip;"
+          autocomplete="off"
+          hidden
+        />
+      </div>
+      <nav id="tree" class="tree" aria-label="Page tree"></nav>
+    </aside>
+
+    <main id="content" class="content">
+      <div id="welcome" class="welcome">
+        <h1>Confluence Page Explorer</h1>
+        <p>Select a space from the search box above to browse its page tree.</p>
+        <p class="hint">
+          Data is read live from <code>web/data/</code>. After updating
+          <code>source-states/</code>, run
+          <code>python3 scripts/build_web_data.py</code> and refresh.
+        </p>
+        <div id="stats" class="stats"></div>
+      </div>
+
+      <article id="page-view" class="page-view" hidden>
+        <div id="breadcrumb" class="breadcrumb"></div>
+        <h1 id="page-title" class="page-title"></h1>
+        <div id="page-meta" class="page-meta"></div>
+        <div class="page-body">
+          <div class="placeholder">
+            <div class="placeholder-icon">&#128196;</div>
+            <p class="placeholder-title">Content placeholder</p>
+            <p class="placeholder-text">
+              The page body has not been exported yet. Use the link below to open
+              the original page in Confluence.
+            </p>
+            <a id="page-source-link" class="source-link" href="#" target="_blank" rel="noopener">
+              Open in Confluence &#8599;
+            </a>
+          </div>
+        </div>
+        <div id="child-list" class="child-list"></div>
+      </article>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
